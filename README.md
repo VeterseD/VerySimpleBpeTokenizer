@@ -177,6 +177,3 @@ No more pairs to merge after 1115 merges
 
 MIT
 
-## Автор
-
-Создано с помощью Kiro AI
