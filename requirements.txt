@@ -1,0 +1,4 @@
+# torch ставится отдельно (CUDA-сборка, уже есть в venv)
+numpy
+chess>=1.10
+pytest
