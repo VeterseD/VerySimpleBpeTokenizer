@@ -4,20 +4,24 @@
 
 ## Установка
 
-Нужны PyTorch с CUDA (у тебя уже стоит в venv) и Rust.
+```powershell
+F:\venvs\torch\Scripts\Activate.ps1
+cd <папка с репой>
 
-```bash
-# найти venv с torch
-find ~ -type d -path "*site-packages/torch" 2>/dev/null        # Linux
-Get-ChildItem $HOME -Recurse -Filter torch -Directory -EA 0 | ? FullName -match 'site-packages\\torch$'   # Windows PowerShell
-
-source <venv>/bin/activate          # Windows: <venv>\Scripts\activate
-pip install -r requirements.txt
-pip install ./azchess_rs            # собирает Rust-модуль (нужен rustup, на Windows ещё MSVC Build Tools)
-python -c "import torch, azchess_rs; print(torch.cuda.is_available())"   # должно быть True
+# что уже стоит
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+pip list | Select-String -Pattern "^(torch|numpy|chess|maturin|pytest) "
+rustc --version
 ```
 
-Если меняешь Rust-код, пересобери модуль: `maturin develop --release -m azchess_rs/Cargo.toml`.
+Ставь только то, чего нет в выводе. `pip install` пропускает пакеты, которые уже стоят, torch он не трогает.
+
+```powershell
+pip install chess maturin pytest          # только отсутствующие
+pip install --no-deps .\azchess_rs         # сборка Rust-модуля, зависимости не трогает
+```
+
+Для сборки нужен Rust (https://rustup.rs) и на Windows MSVC Build Tools (C++). Если меняешь Rust-код: `maturin develop --release -m azchess_rs/Cargo.toml`.
 
 ## Обучение
 

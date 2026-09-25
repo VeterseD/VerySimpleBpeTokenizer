@@ -1,4 +1,4 @@
-# torch ставится отдельно (CUDA-сборка, уже есть в venv); нативный модуль: pip install ./azchess_rs
+# torch не нужен здесь: берётся из существующего venv. Нативный модуль: pip install --no-deps ./azchess_rs
 numpy
 chess>=1.10
 maturin>=1.7
