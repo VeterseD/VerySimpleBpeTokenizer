@@ -3,9 +3,11 @@ import sys
 from pathlib import Path
 
 import chess
+import chess.pgn
 import numpy as np
 
 import arena
+import games
 import train
 from azchess.replay import ReplayBuffer
 
@@ -46,6 +48,16 @@ def test_train_resume_uci_and_arena(tmp_path, capsys):
     ckpt = tmp_path / "latest.pt"
     assert list(tmp_path.glob("step_*.pt")) and (tmp_path / "buffer.npz").exists()
 
+    pgns = list((tmp_path / "games").glob("selfplay_*.pgn"))
+    assert pgns
+    games.main([str(tmp_path / "games"), "--list", "3"])
+    listing = capsys.readouterr().out
+    assert "games, avg" in listing and "termination:" in listing
+    last_round = listing.strip().splitlines()[-1].split()[0]
+    games.main([str(tmp_path / "games"), "--show", last_round])
+    shown = capsys.readouterr().out
+    assert "Termination:" in shown and "final position:" in shown
+
     proc = subprocess.run(
         [sys.executable, str(ROOT / "uci.py"), str(ckpt), "--device", "cpu"],
         input="uci\nisready\nposition startpos moves e2e4\ngo nodes 64\ngo movetime 200\n"
@@ -59,5 +71,10 @@ def test_train_resume_uci_and_arena(tmp_path, capsys):
     assert len(best) == 3 and all(chess.Move.from_uci(m) in board.legal_moves for m in best[:2])
     assert best[2] == "a1a8"
 
-    arena.main([str(ckpt), "random", "--games", "4", "--simulations", "8", "--max-plies", "30", "--device", "cpu"])
+    arena_pgn = tmp_path / "arena.pgn"
+    arena.main([str(ckpt), "random", "--games", "4", "--simulations", "8", "--max-plies", "30", "--device", "cpu",
+                "--pgn", str(arena_pgn)])
     assert "A vs B: +" in capsys.readouterr().out
+    with open(arena_pgn) as fh:
+        arena_games = [g for g in iter(lambda: chess.pgn.read_game(fh), None)]
+    assert len(arena_games) == 4 and all(g.headers["Event"] == "azchess arena" for g in arena_games)

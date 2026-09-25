@@ -53,12 +53,15 @@ class SelfPlayRunner:
         return sum(g.total_sims for g in self.groups)
 
     def take_finished(self):
-        """Concatenated (planes, idx, probs f16, z, results, plies) or None."""
+        """(planes, idx, probs f16, z, results, plies, movetext list, termination list) or None."""
         parts = [g.take_finished() for g in self.groups if g.num_finished]
         if not parts:
             return None
-        planes, idx, probs, z, results, plies = (np.concatenate(x) for x in zip(*parts))
-        return planes, idx, probs.astype(np.float16), z, results, plies
+        columns = list(zip(*parts))
+        planes, idx, probs, z, results, plies = (np.concatenate(x) for x in columns[:6])
+        movetext = [m for part in columns[6] for m in part]
+        terminations = [t for part in columns[7] for t in part]
+        return planes, idx, probs.astype(np.float16), z, results, plies, movetext, terminations
 
 
 def load_weights(path: str) -> dict:

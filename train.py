@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from azchess.encoding import POLICY_SIZE
+from azchess.gamelog import TERMINATION_SHORT, GameLogger
 from azchess.model import AlphaZeroNet, amp_dtype_for, default_device, save_checkpoint
 from azchess.replay import ReplayBuffer
 from azchess.selfplay import SelfPlayConfig, selfplay_worker
@@ -49,6 +50,8 @@ def parse_args(argv=None):
     p.add_argument("--snapshot-every", type=int, default=10_000, help="keep step_XXXXXXX.pt every N steps")
     p.add_argument("--buffer-save-minutes", type=float, default=30.0)
     p.add_argument("--log-seconds", type=float, default=30.0)
+    p.add_argument("--pgn-every", type=int, default=1, help="write every N-th self-play game to runs/.../games (0 = off)")
+    p.add_argument("--pgn-games-per-file", type=int, default=10_000)
     p.add_argument("--device", default=None)
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--seed", type=int, default=0)
@@ -112,8 +115,11 @@ class Stats:
         self.t0 = time.monotonic()
         self.positions = self.games = self.sims = self.plies = self.steps = 0
         self.wdl = [0, 0, 0]
+        self.endings = dict.fromkeys(TERMINATION_SHORT.values(), 0)
 
-    def add_games(self, results: np.ndarray, plies: np.ndarray, positions: int):
+    def add_games(self, results: np.ndarray, plies: np.ndarray, positions: int, terminations: list[str]):
+        for t in terminations:
+            self.endings[TERMINATION_SHORT[t]] += 1
         self.games += len(results)
         self.plies += int(plies.sum())
         self.positions += positions
@@ -170,10 +176,10 @@ def main(argv=None):
 
     def publish():
         save_checkpoint(weights_path, model.state_dict())
-        version.value += 1
+        version.value = step  # workers reload when it changes and tag games with it
 
     ctx = mp.get_context("spawn")
-    version = ctx.Value("q", 0)
+    version = ctx.Value("q", -1)
     stop = ctx.Event()
     games_queue = ctx.Queue(maxsize=64)
     publish()
@@ -199,21 +205,23 @@ def main(argv=None):
         w.start()
 
     stats = Stats()
+    game_log = GameLogger(run_dir / "games", args.pgn_every, args.pgn_games_per_file, first_game=total_games)
     last_publish = last_ckpt = last_snapshot = step
     last_buffer_save = time.monotonic()
     losses = None
 
     def handle(msg):
         nonlocal total_positions, total_games
-        _, _, finished, sims, _ = msg
+        _, worker_id, finished, sims, net_step = msg
         stats.sims += sims
         if finished is None:
             return
-        planes, idx, probs, z, results, plies = finished
+        planes, idx, probs, z, results, plies, movetext, terminations = finished
         buffer.add_batch(planes, idx, probs, z)
+        game_log.write(movetext, results, terminations, plies, net_step=net_step, worker=worker_id)
         total_positions += len(z)
         total_games += len(results)
-        stats.add_games(results, plies, len(z))
+        stats.add_games(results, plies, len(z), terminations)
 
     try:
         while args.total_steps is None or step < args.total_steps:
@@ -259,9 +267,11 @@ def main(argv=None):
                 g = max(stats.games, 1)
                 w, d, l = (100 * x / g for x in stats.wdl)
                 loss_str = f"policy {losses[0]:.3f} value {losses[1]:.3f}" if losses else "waiting for min-buffer"
+                ends = " ".join(f"{k} {100 * v / g:.0f}%" for k, v in stats.endings.items() if v)
                 print(
                     f"[step {step}] {stats.sims / dt:,.0f} sims/s {stats.positions / dt:,.0f} pos/s "
-                    f"{stats.games / dt:.1f} games/s | W/D/L {w:.0f}/{d:.0f}/{l:.0f}% avg {stats.plies / g:.0f} plies | "
+                    f"{stats.games / dt:.1f} games/s | W/D/L {w:.0f}/{d:.0f}/{l:.0f}% avg {stats.plies / g:.0f} plies "
+                    f"({ends or 'no games yet'}) | "
                     f"{stats.steps / dt:.1f} steps/s {loss_str} | buffer {buffer.size:,} games {total_games:,}",
                     flush=True,
                 )
@@ -270,6 +280,7 @@ def main(argv=None):
         print("stopping...", flush=True)
     finally:
         stop.set()
+        game_log.close()
         checkpoint()
         buffer.save(buffer_path)
         for w in workers:
