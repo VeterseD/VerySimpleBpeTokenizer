@@ -1,27 +1,23 @@
 # azchess
 
-Шахматный движок в стиле AlphaZero на PyTorch: ResNet (policy + value), PUCT MCTS, self-play, обучение на CUDA и UCI для игры в GUI.
+Шахматный движок в стиле AlphaZero. Сеть ResNet (policy + value) на PyTorch/CUDA, а MCTS, генерация ходов и кодирование доски написаны на Rust ([shakmaty](https://crates.io/crates/shakmaty) + PyO3 + rayon). Python только гоняет сеть и обучение.
 
 ## Установка
 
-PyTorch с CUDA уже стоит в твоём venv, нужно только найти его и доставить `chess` и `numpy`.
+Нужны PyTorch с CUDA (у тебя уже стоит в venv) и Rust.
 
 ```bash
-# Linux: найти venv с torch
-find ~ -type d -path "*site-packages/torch" 2>/dev/null   # путь до lib/... и есть venv
-source <путь>/bin/activate
-```
+# найти venv с torch
+find ~ -type d -path "*site-packages/torch" 2>/dev/null        # Linux
+Get-ChildItem $HOME -Recurse -Filter torch -Directory -EA 0 | ? FullName -match 'site-packages\\torch$'   # Windows PowerShell
 
-```powershell
-# Windows: найти venv с torch
-Get-ChildItem $HOME -Recurse -Filter torch -Directory -ErrorAction SilentlyContinue | Where-Object FullName -match 'site-packages\\torch$'
-<путь>\Scripts\activate
-```
-
-```bash
+source <venv>/bin/activate          # Windows: <venv>\Scripts\activate
 pip install -r requirements.txt
-python -c "import torch; print(torch.cuda.is_available())"   # должно быть True
+pip install ./azchess_rs            # собирает Rust-модуль (нужен rustup, на Windows ещё MSVC Build Tools)
+python -c "import torch, azchess_rs; print(torch.cuda.is_available())"   # должно быть True
 ```
+
+Если меняешь Rust-код, пересобери модуль: `maturin develop --release -m azchess_rs/Cargo.toml`.
 
 ## Обучение
 
@@ -29,29 +25,37 @@ python -c "import torch; print(torch.cuda.is_available())"   # должно бы
 python train.py --run-dir runs/main
 ```
 
-Одна итерация: `--games-per-iter` партий self-play → позиции в replay buffer → `ceil(новые позиции * reuse / batch)` шагов обучения → `latest.pt` и `buffer.npz`. Если остановить (Ctrl+C) и запустить снова, обучение продолжится с последнего чекпоинта. Каждые `--save-every` итераций сохраняется `iter_XXXX.pt`.
+Обучение асинхронное, как в Lc0/KataGo:
 
-Основные параметры (дефолты):
+- **Self-play процесс** держит 512 партий одновременно. Rust на всех ядрах спускается по деревьям и отдаёт батч листьев, сеть оценивает его на GPU в bf16/fp16. Партии разбиты на две группы: пока GPU считает одну, CPU ищет по другой.
+- **Тренер** (основной процесс) параллельно учится на replay buffer, каждые `--publish-every` шагов отдаёт свежие веса в self-play и держит соотношение: в среднем `--reuse` обучающих примеров на одну новую позицию.
+- **Playout cap randomization** (KataGo): 25% ходов ищутся на `--simulations 200` и идут в обучение, остальные делаются быстро на `--fast-simulations 50` и не записываются. Партий генерируется в несколько раз больше за то же время. Отключается флагом `--full-search-prob 1`.
+
+Ctrl+C сохраняет `latest.pt` и `buffer.npz`, следующий запуск продолжит с того же места. Каждые `--snapshot-every` шагов сохраняется `step_XXXXXXX.pt` для сравнения версий.
+
+Раз в 30 секунд печатается строка статистики:
+```
+[step 1200] 41,000 sims/s 1,900 pos/s 9.8 games/s | W/D/L 31/40/29% avg 190 plies | 7.4 steps/s policy 2.810 value 0.612 | buffer 310,000 games 20,400
+```
+
+Главные параметры:
 
 | параметр | дефолт | что это |
 |---|---|---|
 | `--blocks` / `--channels` | 10 / 128 | размер ResNet (~3.4M параметров), у AlphaZero было 20x256 |
-| `--simulations` | 200 | симуляций MCTS на ход (у AlphaZero 800) |
-| `--parallel-games` | 128 | партий одновременно = размер батча для сети |
-| `--games-per-iter` | 256 | партий за итерацию |
-| `--buffer-size` / `--min-buffer` | 500k / 20k | окно позиций и минимум до старта обучения |
-| `--batch-size` / `--lr` | 1024 / 1e-3 | AdamW, weight decay 1e-4 |
-| `--reuse` | 4 | сколько раз в среднем учимся на каждой позиции |
+| `--games-per-worker` | 512 | партий одновременно, половина из них = размер батча сети |
+| `--workers` | 1 | процессов self-play. Rust и так занимает все ядра, 2 могут помочь, если GPU недогружен |
+| `--simulations` / `--fast-simulations` / `--full-search-prob` | 200 / 50 / 0.25 | см. выше |
+| `--buffer-size` / `--min-buffer` | 1M / 50k | окно позиций и минимум до старта обучения |
+| `--batch-size` / `--lr` / `--reuse` | 1024 / 1e-3 / 4 | AdamW, weight decay 1e-4 |
 
-Mixed precision включается само: bf16, а если карта его не поддерживает, fp16 с GradScaler. Отключается флагом `--no-amp`.
-
-Узкое место: MCTS написан на чистом Python и выдаёт около 6k симуляций/с на ядро, так что GPU будет простаивать. Если self-play медленный, сначала уменьши `--simulations` (100 для старта нормально) и `--max-plies`.
+**Если self-play медленный** (мало `sims/s`, GPU загружен не полностью), подними `--games-per-worker` или поставь `--workers 2`. **Если GPU загружен на 100%**, это нормально: упираемся в сеть. Ускоряют либо сеть поменьше, либо меньше `--simulations`.
 
 ## Проверка силы
 
 ```bash
-python arena.py runs/main/latest.pt random --games 50              # против случайных ходов
-python arena.py runs/main/iter_0050.pt runs/main/iter_0020.pt      # прогресс между версиями
+python arena.py runs/main/latest.pt random --games 50
+python arena.py runs/main/step_0050000.pt runs/main/step_0020000.pt --games 200
 ```
 
 ## Игра
@@ -60,14 +64,14 @@ python arena.py runs/main/iter_0050.pt runs/main/iter_0020.pt      # прогр�
 python uci.py runs/main/latest.pt --nodes 800
 ```
 
-Добавь эту команду как движок в Cute Chess / Arena / En Croissant. Поддерживается `go nodes`, `go movetime` и `go wtime/btime`. Команду `stop` движок не обрабатывает.
+Добавь эту команду как движок в Cute Chess / Arena / En Croissant. Поддерживаются `go nodes`, `go movetime` и `go wtime/btime`. Поиск батчит по 16 листьев за вызов сети (virtual loss, `--batch`).
 
 ## Устройство
 
-- `azchess/encoding.py`: вход 20 плоскостей 8x8 (фигуры, повторение, рокировки, правило 50 ходов, en passant) и политика 73x8x8 = 4672 хода, как в AlphaZero. Доска всегда повёрнута к стороне, которая ходит.
-- `azchess/model.py`: ResNet, conv policy head, value head с tanh.
-- `azchess/mcts.py`: PUCT с FPU, шум Дирихле в корне, переиспользование дерева. Деревья всех параллельных партий оцениваются одним батчем.
-- `azchess/selfplay.py`: первые 30 полуходов ход выбирается пропорционально визитам, дальше берётся лучший.
-- `azchess/replay.py`: кольцевой буфер с разреженными policy-таргетами.
+- `azchess_rs/src/lib.rs`: кодирование (20 плоскостей 8x8), политика 73x8x8 = 4672 хода как в AlphaZero, PUCT с FPU, шум Дирихле, virtual loss, переиспользование дерева, `SelfPlay` (партии для обучения) и `Searcher` (игра и arena).
+- `azchess/model.py`: ResNet с conv policy head и value head на tanh.
+- `azchess/inference.py`: асинхронные вызовы сети (pinned memory, CUDA events).
+- `azchess/selfplay.py`: процесс self-play. `train.py`: тренер.
+- `azchess/encoding.py`: эталонная реализация кодирования на python-chess. Тесты сверяют с ней Rust-код.
 
 Тесты: `python -m pytest`.

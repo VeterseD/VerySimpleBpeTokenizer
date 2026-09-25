@@ -7,3 +7,6 @@ runs/
 *.pt
 *.npz
 .hoplite/
+target/
+*.so
+*.pyd

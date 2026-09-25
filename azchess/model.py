@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -58,7 +59,7 @@ class AlphaZeroNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """x: uint8/float planes (B, NUM_PLANES, 8, 8) -> policy logits (B, 4672), value (B,) in [-1, 1]."""
-        x = x.float() * self.input_scale
+        x = x.to(self.input_scale.dtype) * self.input_scale
         h = self.tower(self.stem(x))
         return self.policy_head(h).flatten(1), self.value_head(h).squeeze(1)
 
@@ -73,20 +74,19 @@ def amp_dtype_for(device: torch.device) -> torch.dtype | None:
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
-def save_checkpoint(path: Path, model: AlphaZeroNet, optimizer=None, iteration: int = 0) -> None:
+def save_checkpoint(path: Path, data: dict) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "model_config": model.config,
-            "optimizer": optimizer.state_dict() if optimizer is not None else None,
-            "iteration": iteration,
-        },
-        tmp,
-    )
-    os.replace(tmp, path)
+    torch.save(data, tmp)
+    for attempt in range(50):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:  # Windows: a self-play worker may be reading the file right now
+            if attempt == 49:
+                raise
+            time.sleep(0.1)
 
 
 def load_checkpoint(path: Path, device: torch.device) -> tuple[AlphaZeroNet, dict]:

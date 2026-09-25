@@ -7,7 +7,6 @@ from pathlib import Path
 import numpy as np
 
 from .encoding import MAX_LEGAL_MOVES, NUM_PLANES
-from .selfplay import GameRecord
 
 
 class ReplayBuffer:
@@ -20,20 +19,19 @@ class ReplayBuffer:
         self.size = 0
         self.pos = 0
 
-    def add(self, planes: np.ndarray, idx: np.ndarray, probs: np.ndarray, value: float) -> None:
-        i, k = self.pos, len(idx)
-        self.planes[i] = planes
-        self.policy_idx[i] = -1
-        self.policy_idx[i, :k] = idx
-        self.policy_p[i] = 0
-        self.policy_p[i, :k] = probs
-        self.value[i] = value
-        self.pos = (i + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-
-    def add_game(self, rec: GameRecord) -> None:
-        for planes, idx, probs, value in zip(rec.planes, rec.policy_idx, rec.policy_p, rec.value_targets()):
-            self.add(planes, idx, probs, value)
+    def add_batch(self, planes: np.ndarray, idx: np.ndarray, probs: np.ndarray, value: np.ndarray) -> None:
+        """idx/probs are padded to MAX_LEGAL_MOVES with -1 / 0."""
+        n = len(value)
+        if n > self.capacity:
+            planes, idx, probs, value = (a[-self.capacity :] for a in (planes, idx, probs, value))
+            n = self.capacity
+        rows = (self.pos + np.arange(n)) % self.capacity
+        self.planes[rows] = planes
+        self.policy_idx[rows] = idx
+        self.policy_p[rows] = probs
+        self.value[rows] = value
+        self.pos = int((self.pos + n) % self.capacity)
+        self.size = min(self.size + n, self.capacity)
 
     def sample(self, n: int, rng: np.random.Generator):
         i = rng.integers(0, self.size, n)
