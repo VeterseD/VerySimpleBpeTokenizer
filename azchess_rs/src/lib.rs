@@ -7,6 +7,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use shakmaty::fen::Fen;
+use shakmaty::san::SanPlus;
 use shakmaty::uci::UciMove;
 use shakmaty::zobrist::Zobrist64;
 use shakmaty::{
@@ -166,15 +167,29 @@ fn repetitions(hist: &[u64], path: &[u64], halfmoves: u32) -> u32 {
     count
 }
 
-/// Game value for the side to move, or None if the game continues.
-fn terminal_value(pos: &Chess, no_legal_moves: bool, reps: u32) -> Option<f32> {
+/// (game value for the side to move, PGN termination reason), or None if the game continues.
+fn termination(pos: &Chess, no_legal_moves: bool, reps: u32) -> Option<(f32, &'static str)> {
     if no_legal_moves {
-        return Some(if pos.is_check() { -1.0 } else { 0.0 });
+        return Some(if pos.is_check() { (-1.0, "checkmate") } else { (0.0, "stalemate") });
     }
-    if pos.halfmoves() >= 100 || reps >= 2 || pos.is_insufficient_material() {
-        return Some(0.0);
+    if reps >= 2 {
+        return Some((0.0, "threefold repetition"));
+    }
+    if pos.halfmoves() >= 100 {
+        return Some((0.0, "fifty-move rule"));
+    }
+    if pos.is_insufficient_material() {
+        return Some((0.0, "insufficient material"));
     }
     None
+}
+
+fn terminal_value(pos: &Chess, no_legal_moves: bool, reps: u32) -> Option<f32> {
+    termination(pos, no_legal_moves, reps).map(|(v, _)| v)
+}
+
+fn san(pos: &Chess, m: Move) -> String {
+    SanPlus::from_move(pos.clone(), m).to_string()
 }
 
 fn parse_position(fen: Option<&str>, moves: &[String]) -> PyResult<(Chess, Vec<u64>)> {
@@ -476,7 +491,11 @@ impl Search {
 
     /// Value of the current (root) position for the side to move if the game is over.
     fn game_over(&self) -> Option<f32> {
-        terminal_value(&self.pos, self.pos.legal_moves().is_empty(), self.root_reps())
+        self.termination().map(|(v, _)| v)
+    }
+
+    fn termination(&self) -> Option<(f32, &'static str)> {
+        termination(&self.pos, self.pos.legal_moves().is_empty(), self.root_reps())
     }
 }
 
@@ -531,6 +550,61 @@ struct FinishedGame {
     samples: Vec<Sample>,
     result: f32, // white's perspective
     plies: u32,
+    movetext: String,
+    termination: &'static str,
+}
+
+/// PGN movetext with search info as comments on fully searched moves.
+#[derive(Default)]
+struct PgnWriter {
+    text: String,
+    after_comment: bool,
+}
+
+impl PgnWriter {
+    fn push_move(&mut self, pos: &Chess, m: Move) {
+        if !self.text.is_empty() {
+            self.text.push(' ');
+        }
+        let n = pos.fullmoves();
+        if pos.turn() == Color::White {
+            self.text.push_str(&format!("{n}. "));
+        } else if self.text.is_empty() || self.after_comment {
+            self.text.push_str(&format!("{n}... "));
+        }
+        self.text.push_str(&san(pos, m));
+        self.after_comment = false;
+    }
+
+    /// Root visits, root Q and the top branches (SAN visits prior Q), all from the mover's view.
+    fn push_search(&mut self, pos: &Chess, edges: &[Edge], sampled: bool) {
+        let visits: u32 = edges.iter().map(|e| e.n).sum();
+        let w: f32 = edges.iter().map(|e| e.w).sum();
+        let mut order: Vec<usize> = (0..edges.len()).collect();
+        order.sort_by(|&a, &b| edges[b].n.cmp(&edges[a].n).then(edges[b].p.total_cmp(&edges[a].p)));
+        let top: Vec<String> = order
+            .iter()
+            .take(3)
+            .map(|&i| {
+                let e = &edges[i];
+                let q = if e.n > 0 { e.w / e.n as f32 } else { 0.0 };
+                format!("{} {} p={:.2} q={:+.2}", san(pos, e.mv), e.n, e.p, q)
+            })
+            .collect();
+        let q = if visits > 0 { w / visits as f32 } else { 0.0 };
+        let tag = if sampled { " sampled" } else { "" };
+        self.text.push_str(&format!(" {{N={visits} Q={q:+.2}{tag} | {}}}", top.join(", ")));
+        self.after_comment = true;
+    }
+
+    fn finish(mut self, result: f32) -> String {
+        let r = if result > 0.0 { "1-0" } else if result < 0.0 { "0-1" } else { "1/2-1/2" };
+        if !self.text.is_empty() {
+            self.text.push(' ');
+        }
+        self.text.push_str(r);
+        self.text
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -551,13 +625,21 @@ struct Game {
     plies: u32,
     full: bool,
     rng: Rng,
+    pgn: PgnWriter,
 }
 
 impl Game {
     fn new(cfg: &SelfPlayConfig, seed: u64) -> Self {
         let pos = Chess::default();
         let hist = vec![hash(&pos)];
-        let mut g = Game { search: Search::new(pos, hist), samples: Vec::new(), plies: 0, full: true, rng: Rng(seed) };
+        let mut g = Game {
+            search: Search::new(pos, hist),
+            samples: Vec::new(),
+            plies: 0,
+            full: true,
+            rng: Rng(seed),
+            pgn: PgnWriter::default(),
+        };
         g.start_move(cfg);
         g
     }
@@ -609,20 +691,27 @@ impl Game {
         } else {
             self.search.tree.best_edge()
         };
+        let root = self.search.tree.root();
+        self.pgn.push_move(&self.search.pos, root.edges[e].mv);
+        if self.full {
+            let sampled = e != self.search.tree.best_edge();
+            self.pgn.push_search(&self.search.pos, &root.edges, sampled);
+        }
         self.search.play(e);
         self.plies += 1;
 
-        let result = match self.search.game_over() {
-            Some(v) => Some(if self.search.pos.turn() == Color::White { v } else { -v }),
-            None if self.plies >= cfg.max_plies => Some(0.0),
+        let result = match self.search.termination() {
+            Some((v, reason)) => Some((if self.search.pos.turn() == Color::White { v } else { -v }, reason)),
+            None if self.plies >= cfg.max_plies => Some((0.0, "max plies")),
             None => None,
         };
-        let finished = result.map(|result| {
+        let finished = result.map(|(result, termination)| {
             let samples = std::mem::take(&mut self.samples);
+            let movetext = std::mem::take(&mut self.pgn).finish(result);
             let plies = self.plies;
             let seed = self.rng.next_u64();
             *self = Game::new(cfg, seed);
-            FinishedGame { samples, result, plies }
+            FinishedGame { samples, result, plies, movetext, termination }
         });
         if finished.is_none() {
             self.start_move(cfg);
@@ -731,7 +820,8 @@ impl SelfPlay {
     }
 
     /// Returns (planes u8 [T,20,8,8], policy_idx i16 [T,256] (-1 pad), policy_p f32 [T,256], z f32 [T],
-    /// results f32 [games] (white's view), plies u32 [games]) and clears the finished list.
+    /// results f32 [games] (white's view), plies u32 [games], PGN movetext [games], termination [games])
+    /// and clears the finished list.
     #[allow(clippy::type_complexity)]
     fn take_finished<'py>(
         &mut self,
@@ -743,6 +833,8 @@ impl SelfPlay {
         Bound<'py, PyArray1<f32>>,
         Bound<'py, PyArray1<f32>>,
         Bound<'py, PyArray1<u32>>,
+        Vec<String>,
+        Vec<String>,
     )> {
         let games = std::mem::take(&mut self.finished);
         let t: usize = games.iter().map(|g| g.samples.len()).sum();
@@ -764,6 +856,8 @@ impl SelfPlay {
         }
         let results: Vec<f32> = games.iter().map(|g| g.result).collect();
         let plies: Vec<u32> = games.iter().map(|g| g.plies).collect();
+        let terminations: Vec<String> = games.iter().map(|g| g.termination.to_string()).collect();
+        let movetext: Vec<String> = games.into_iter().map(|g| g.movetext).collect();
         Ok((
             planes_array(py, planes, t)?,
             PyArray1::from_vec(py, idx).reshape([t, MAX_LEGAL_MOVES])?,
@@ -771,6 +865,8 @@ impl SelfPlay {
             PyArray1::from_vec(py, z),
             PyArray1::from_vec(py, results),
             PyArray1::from_vec(py, plies),
+            movetext,
+            terminations,
         ))
     }
 }

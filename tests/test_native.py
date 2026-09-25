@@ -1,4 +1,7 @@
+import io
+
 import chess
+import chess.pgn
 import numpy as np
 import pytest
 
@@ -71,13 +74,30 @@ def test_selfplay_produces_consistent_training_data():
     while sp.num_finished < 6:
         logits, values = uniform_evaluator(sp.collect())
         sp.apply(logits, values)
-    planes, idx, probs, z, results, plies = sp.take_finished()
+    planes, idx, probs, z, results, plies, movetext, terminations = sp.take_finished()
     assert planes.shape[1:] == (20, 8, 8) and len(planes) == len(idx) == len(probs) == len(z)
     assert 0 < len(z) < plies.sum()  # only full searches are recorded
     np.testing.assert_allclose(probs.sum(1), 1, atol=1e-5)
     assert (probs[idx < 0] == 0).all() and idx.max() < POLICY_SIZE
     assert set(np.abs(z)) <= {0.0, 1.0} and set(results) <= {-1.0, 0.0, 1.0}
     assert sp.total_sims > 0 and sp.num_finished == 0
+
+    # PGN replays legally to the reported result and termination
+    assert len(movetext) == len(results) == len(terminations)
+    for text, result, n, termination in zip(movetext, results, plies, terminations):
+        game = chess.pgn.read_game(io.StringIO(text))
+        assert not game.errors
+        board = game.end().board()
+        assert len(board.move_stack) == n
+        assert text.endswith({1.0: "1-0", -1.0: "0-1", 0.0: "1/2-1/2"}[float(result)])
+        expected = {
+            "checkmate": board.is_checkmate(), "stalemate": board.is_stalemate(),
+            "threefold repetition": board.is_repetition(3), "fifty-move rule": board.halfmove_clock >= 100,
+            "insufficient material": board.is_insufficient_material(), "max plies": n == 40,
+        }
+        assert expected[termination], (termination, board.fen())
+        comments = [node.comment for node in game.mainline() if node.comment]
+        assert comments and all(c.startswith("N=") and " | " in c for c in comments)
 
 
 def test_apply_rejects_wrong_batch_size():

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import math
+from pathlib import Path
 
 import chess
+import chess.pgn
 import numpy as np
 import torch
 
@@ -45,6 +47,7 @@ def main(argv=None):
     p.add_argument("--max-plies", type=int, default=400)
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--pgn", help="save all games to this PGN file")
     args = p.parse_args(argv)
 
     device = torch.device(args.device) if args.device else default_device()
@@ -60,6 +63,9 @@ def main(argv=None):
     queue = queue[: args.games]
 
     score = {"w": 0, "d": 0, "l": 0}
+    names = (Path(args.model_a).stem, "random" if args.model_b == "random" else Path(args.model_b).stem)
+    pgn_out = open(args.pgn, "a", encoding="utf-8") if args.pgn else None
+    game_no = 0
     slots: list = [None] * args.parallel  # (board, a_is_white, plies)
     while queue or any(slots):
         for s in range(args.parallel):
@@ -93,8 +99,20 @@ def main(argv=None):
             if result is not None:
                 a_result = result if g[1] else -result
                 score["w" if a_result > 0 else "l" if a_result < 0 else "d"] += 1
+                if pgn_out:
+                    game_no += 1
+                    game = chess.pgn.Game.from_board(g[0])
+                    game.headers.update(
+                        Event="azchess arena", Round=str(game_no),
+                        White=names[0] if g[1] else names[1], Black=names[1] if g[1] else names[0],
+                        Result="1-0" if result > 0 else "0-1" if result < 0 else "1/2-1/2",
+                        PlyCount=str(len(g[0].move_stack)), Opening=" ".join(m.uci() for m in g[0].move_stack[: args.opening_plies]),
+                    )
+                    print(game, file=pgn_out, end="\n\n")
                 slots[s] = None
 
+    if pgn_out:
+        pgn_out.close()
     n = sum(score.values())
     s = (score["w"] + 0.5 * score["d"]) / n
     elo = -400 * math.log10(1 / s - 1) if 0 < s < 1 else math.copysign(math.inf, s - 0.5)

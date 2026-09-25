@@ -39,7 +39,7 @@ Ctrl+C сохраняет `latest.pt` и `buffer.npz`, следующий зап
 
 Раз в 30 секунд печатается строка статистики:
 ```
-[step 1200] 41,000 sims/s 1,900 pos/s 9.8 games/s | W/D/L 31/40/29% avg 190 plies | 7.4 steps/s policy 2.810 value 0.612 | buffer 310,000 games 20,400
+[step 1200] 41,000 sims/s 1,900 pos/s 9.8 games/s | W/D/L 31/40/29% avg 190 plies (mate 55% rep 25% material 15% maxplies 5%) | 7.4 steps/s policy 2.810 value 0.612 | buffer 310,000 games 20,400
 ```
 
 Главные параметры:
@@ -55,12 +55,37 @@ Ctrl+C сохраняет `latest.pt` и `buffer.npz`, следующий зап
 
 **Если self-play медленный** (мало `sims/s`, GPU загружен не полностью), подними `--games-per-worker` или поставь `--workers 2`. **Если GPU загружен на 100%**, это нормально: упираемся в сеть. Ускоряют либо сеть поменьше, либо меньше `--simulations`.
 
+## Лог партий
+
+Каждая партия self-play пишется в `runs\main\games\selfplay_XXXXXXXXX.pgn`, новый файл начинается каждые 10 000 партий. В заголовках: номер партии (`Round`), результат, причина конца (`Termination`: checkmate, stalemate, threefold repetition, fifty-move rule, insufficient material, max plies) и шаг обучения сети, которая играла (`NetStep`).
+
+К каждому полностью просчитанному ходу (25% ходов) пишется комментарий с деревом поиска:
+```
+3...  Nb4     N=40 Q=-0.02 sampled | Nb8 8 p=0.05 q=-0.00, c6 6 p=0.11 q=-0.00, Nc5 3 p=0.07 q=-0.02
+```
+- `N`: визиты корня, вместе с переиспользованным поддеревом прошлого хода, поэтому может быть больше `--simulations`.
+- `Q`: оценка позиции поиском для того, кто ходит (от -1 до 1).
+- дальше топ-3 ветки: ход, визиты, `p` (prior сети), `q` (оценка хода поиском).
+- `sampled` значит, что ход выбран температурой, а не самый посещаемый.
+
+Просмотр:
+```powershell
+python games.py runs\main\games                                      # сводка: результаты, причины конца
+python games.py runs\main\games --result 0-1 --list 20               # последние 20 побед чёрных
+python games.py runs\main\games --termination checkmate --min-step 50000 --list 10
+python games.py runs\main\games --show 12345                         # партия ход за ходом с деревом
+```
+PGN открывается и в любом GUI (En Croissant, lichess import), комментарии там тоже видны. Партия с комментариями весит около 5 КБ. Если файлы слишком разрастаются, пиши каждую N-ю партию через `--pgn-every 10`, отключить запись можно через `--pgn-every 0`.
+
+В строке лога обучения теперь есть доли причин конца, например `(mate 12% rep 40% material 30% maxplies 18%)`.
+
 ## Проверка силы
 
 ```bash
 python arena.py runs/main/latest.pt random --games 50
-python arena.py runs/main/step_0050000.pt runs/main/step_0020000.pt --games 200
+python arena.py runs/main/step_0050000.pt runs/main/step_0020000.pt --games 200 --pgn arena.pgn
 ```
+С `--pgn` партии матча сохраняются в файл, смотреть их тем же `games.py`.
 
 ## Игра
 
