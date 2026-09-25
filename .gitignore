@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+runs/
+*.pt
+*.npz
+.hoplite/
+target/
+*.so
+*.pyd
